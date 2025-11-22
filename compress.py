@@ -7,6 +7,7 @@ Dynamic Range Compression CLI
 import argparse
 import json
 import os
+import re
 import sys
 import soundfile as sf
 import numpy as np
@@ -16,24 +17,18 @@ from lufs_meter import LUFSMeter
 
 def load_config(config_path):
     """
-    JSON 설정 파일 로드
+    JSON 설정 파일 로드 (전체)
 
     Args:
         config_path: JSON 파일 경로
 
     Returns:
-        dict: 설정 딕셔너리 (compression 섹션)
+        dict: 전체 설정 딕셔너리
     """
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
-
-        # compression 섹션 추출
-        if 'compression' in config:
-            return config['compression']
-        else:
-            print(f"⚠️  Warning: 'compression' section not found in {config_path}")
-            return {}
+        return config
     except FileNotFoundError:
         print(f"❌ Error: Config file not found: {config_path}")
         sys.exit(1)
@@ -42,21 +37,127 @@ def load_config(config_path):
         sys.exit(1)
 
 
+def extract_metadata(config):
+    """
+    JSON에서 메타데이터 추출
+
+    Args:
+        config: 전체 설정 딕셔너리
+
+    Returns:
+        dict: 메타데이터 (dynamic_range, bandwidth, gate_threshold)
+    """
+    metadata = {
+        'dynamic_range': None,
+        'bandwidth': None,
+        'gate_threshold': None
+    }
+
+    # Dynamic range 추출 (compression.reason에서)
+    if 'compression' in config and 'reason' in config['compression']:
+        reason = config['compression']['reason']
+        # "Large dynamic range (30.6 dB)" 형식에서 숫자 추출
+        match = re.search(r'(\d+\.?\d*)\s*dB', reason)
+        if match:
+            metadata['dynamic_range'] = float(match.group(1))
+
+    # Bandwidth 추출 (voice_enhancement.reason에서)
+    if 'voice_enhancement' in config and 'reason' in config['voice_enhancement']:
+        reason = config['voice_enhancement']['reason']
+        # "Wide bandwidth (9755 Hz)" 형식에서 숫자 추출
+        match = re.search(r'(\d+)\s*Hz', reason)
+        if match:
+            metadata['bandwidth'] = int(match.group(1))
+
+    # Gate threshold 추출 (noise_reduction에서)
+    if 'noise_reduction' in config and 'gate_threshold' in config['noise_reduction']:
+        metadata['gate_threshold'] = config['noise_reduction']['gate_threshold']
+
+    return metadata
+
+
+def calculate_adaptive_params(metadata, base_params):
+    """
+    메타데이터 기반 adaptive parameter 계산
+
+    Args:
+        metadata: 추출된 메타데이터
+        base_params: 기본 파라미터 (JSON compression 섹션 또는 기본값)
+
+    Returns:
+        dict: 최적화된 파라미터
+    """
+    params = base_params.copy()
+
+    # Dynamic range 기반 ratio 조정
+    if metadata['dynamic_range'] is not None:
+        dr = metadata['dynamic_range']
+        if dr > 25:
+            # 큰 다이나믹 레인지: 더 강한 압축
+            params['ratio'] = params.get('ratio', 4.0)
+        elif dr > 15:
+            # 중간: 적당한 압축
+            params['ratio'] = params.get('ratio', 3.0)
+        else:
+            # 작은 다이나믹 레인지: 약한 압축
+            params['ratio'] = params.get('ratio', 2.0)
+
+    # Gate threshold 기반 compressor threshold 조정
+    if metadata['gate_threshold'] is not None:
+        # Gate threshold보다 10dB 높게 설정
+        suggested_threshold = metadata['gate_threshold'] + 10
+        if 'threshold' not in params:
+            params['threshold'] = suggested_threshold
+
+    # Bandwidth 기반 attack/release 조정
+    if metadata['bandwidth'] is not None:
+        bw = metadata['bandwidth']
+        if bw > 8000:
+            # 광대역: 빠른 attack/release (디테일 보존)
+            params['attack'] = params.get('attack', 3.0)
+            params['release'] = params.get('release', 40.0)
+        else:
+            # 협대역: 느린 attack/release (부드럽게)
+            params['attack'] = params.get('attack', 7.0)
+            params['release'] = params.get('release', 60.0)
+
+    return params
+
+
 def parse_args():
     """CLI 인자 파싱"""
     parser = argparse.ArgumentParser(
-        description='Dynamic Range Compression with LUFS normalization',
+        description='Dynamic Range Compression with LUFS normalization\n\n'
+                    'Adaptive compression based on audio metadata (dynamic range, bandwidth, gate threshold)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # JSON 설정 사용
-  python cli.py --input input.wav --output output.wav --config config.json
+  # JSON 설정 사용 (adaptive parameters)
+  python compress.py --input input.wav --output output.wav --config config.json
 
   # 수동 파라미터 지정
-  python cli.py --input input.wav --output output.wav --ratio 4.0 --threshold -18
+  python compress.py --input input.wav --output output.wav --ratio 4.0 --threshold -18
 
   # LUFS만 정규화 (압축 없음)
-  python cli.py --input input.wav --output output.wav --ratio 1.0 --target-lufs -16
+  python compress.py --input input.wav --output output.wav --ratio 1.0 --target-lufs -16
+
+Adaptive Parameters:
+  When using --config, the following metadata is automatically extracted and used:
+
+  - dynamic_range (from compression.reason): Auto-adjusts compression ratio
+    • > 25 dB: Strong compression (ratio 4:1)
+    • 15-25 dB: Medium compression (ratio 3:1)
+    • < 15 dB: Light compression (ratio 2:1)
+
+  - gate_threshold (from noise_reduction): Auto-adjusts compressor threshold
+    • Threshold = gate_threshold + 10 dB
+
+  - bandwidth (from voice_enhancement.reason): Auto-adjusts attack/release
+    • > 8000 Hz: Fast attack/release (preserve detail)
+    • < 8000 Hz: Slow attack/release (smooth)
+
+Parameter Priority:
+  CLI options > JSON compression section > Adaptive calculation > Default values
         """
     )
 
@@ -108,18 +209,40 @@ def main():
         os.makedirs(output_dir, exist_ok=True)
         print(f"📁 Created output directory: {output_dir}")
 
-    # 설정 로드
-    config = {}
+    # 설정 로드 및 adaptive parameter 계산
+    full_config = {}
+    compression_config = {}
+    metadata = {}
+
     if args.config:
         print(f"📄 Loading config from: {args.config}")
-        config = load_config(args.config)
-        print(f"   Config loaded: {config}")
+        full_config = load_config(args.config)
 
-    # 파라미터 우선순위: CLI > JSON > 기본값
-    ratio = args.ratio if args.ratio is not None else config.get('ratio', 3.0)
-    threshold = args.threshold if args.threshold is not None else config.get('threshold', -20.0)
-    attack = args.attack if args.attack is not None else config.get('attack', 5.0)
-    release = args.release if args.release is not None else config.get('release', 50.0)
+        # Compression 섹션 추출
+        compression_config = full_config.get('compression', {})
+
+        # 메타데이터 추출
+        metadata = extract_metadata(full_config)
+        print(f"\n🔍 Extracted Metadata:")
+        if metadata['dynamic_range']:
+            print(f"   Dynamic Range: {metadata['dynamic_range']} dB")
+        if metadata['bandwidth']:
+            print(f"   Bandwidth: {metadata['bandwidth']} Hz")
+        if metadata['gate_threshold']:
+            print(f"   Gate Threshold: {metadata['gate_threshold']} dB")
+
+        # Adaptive parameter 계산
+        adaptive_params = calculate_adaptive_params(metadata, compression_config)
+        print(f"\n⚡ Adaptive Parameters:")
+        print(f"   Calculated from metadata: {adaptive_params}")
+    else:
+        adaptive_params = {}
+
+    # 파라미터 우선순위: CLI > JSON compression > Adaptive > 기본값
+    ratio = args.ratio if args.ratio is not None else compression_config.get('ratio', adaptive_params.get('ratio', 3.0))
+    threshold = args.threshold if args.threshold is not None else compression_config.get('threshold', adaptive_params.get('threshold', -20.0))
+    attack = args.attack if args.attack is not None else compression_config.get('attack', adaptive_params.get('attack', 5.0))
+    release = args.release if args.release is not None else compression_config.get('release', adaptive_params.get('release', 50.0))
     knee = args.knee
 
     print("\n" + "="*60)
