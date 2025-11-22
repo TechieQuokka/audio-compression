@@ -22,7 +22,7 @@ pip install -r requirements.txt
 ### 기본 사용 (JSON 설정 파일 활용)
 
 ```bash
-python cli.py \
+python compress.py \
   --input /path/to/input.wav \
   --output /path/to/output.wav \
   --config /path/to/config.json
@@ -44,7 +44,7 @@ python cli.py \
 ### 수동 파라미터 지정
 
 ```bash
-python cli.py \
+python compress.py \
   --input input.wav \
   --output output.wav \
   --ratio 4.0 \
@@ -67,7 +67,7 @@ OUTPUT="/home/beethoven/workspace/deeplearning/project/autokr2/data/compression_
 CONFIG="/home/beethoven/workspace/deeplearning/project/autokr2/data/audio_data/[SubsPlease] Yasei no Last Boss ga Arawareta! - 08 (480p) [30425761].json"
 
 # 실행
-python cli.py --input "$INPUT" --output "$OUTPUT" --config "$CONFIG"
+python compress.py --input "$INPUT" --output "$OUTPUT" --config "$CONFIG"
 ```
 
 ## ⚙️ 파라미터 설명
